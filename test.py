@@ -2,14 +2,199 @@ import json
 import boto3
 import requests
 import os
-import re
 from urllib.parse import unquote_plus
 
-grafana_base_url = 'http://35.154.207.33:3000'
+grafana_base_url = 'http://13.235.79.241:3000'
 s3_client = boto3.client('s3')
 secrets_client = boto3.client('secretsmanager', region_name='ap-south-1')
 
-#get api-key from secretman
+def get_secret(secret_name):
+    try:
+        get_secret_value_response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret = get_secret_value_response['SecretString']
+        return json.loads(secret)
+    except Exception as e:
+        print(f"Error retrieving secret: {str(e)}")
+        raise e
+        
+def get_grafana_folders(grafana_base_url, grafana_api_key):
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {grafana_api_key}'
+    }
+    
+    url = f"{grafana_base_url}/api/folders"
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()  # This will raise an error for bad status codes
+    
+    folders = response.json()
+    return folders
+
+def get_folder_id(folders, folder_title):
+    for folder in folders:
+        if folder['title'] == folder_title:
+            return folder['id']
+    return None
+
+def lambda_handler(event, context):
+    try:
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        key = unquote_plus(key)
+        print(bucket)
+        print(key)
+        print(event)
+        
+        # Extract the file name from the key
+        file_name = os.path.basename(key)
+        dashboard_title = os.path.splitext(file_name)[0]
+        print("Dashboard Title:", dashboard_title)
+
+        # Construct the URL of the file in S3
+        s3_url = f'https://{bucket}.s3.amazonaws.com/{key}'
+        print("S3 URL:", s3_url)
+        
+        # Retrieve Grafana API key from Secrets Manager
+        secret_name = 'grafana/api'
+        secrets = get_secret(secret_name)
+        print("Secrets:", secrets)  # Log the secrets dictionary
+
+        # Access the 'grafana_api_key' from the secrets dictionary
+        grafana_api_key = secrets.get('grafana-api-key')  # Ensure the key name is correct
+
+        # Check if the key is present
+        if not grafana_api_key:
+            raise KeyError("grafana-api-key not found in secrets")
+            
+        grafana_url = f'{grafana_base_url}/api/dashboards/uid/c5b181b2-38c4-4e1e-bde5-abdda68f2642'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {grafana_api_key}', 
+        }
+        
+        response = requests.get(grafana_url, headers=headers)
+        print(response)
+
+        if response.status_code != 200:
+            print('Error:', response.content)
+            return {
+                'statusCode': response.status_code,
+                'body': json.dumps({'error': response.content.decode('utf-8')})
+            }
+        else:
+            print('Inside stream')
+
+        dashboard = json.loads(response.content)
+        print(dashboard)
+        
+        # Update the title of the dashboard to indicate it is a copy
+        dashboard['dashboard']['title'] = dashboard_title
+        # Remove the UID to ensure Grafana assigns a new one
+        dashboard['dashboard'].pop('uid', None)
+        dashboard['dashboard'].pop('id', None)
+        
+        # Retrieve the list of folders
+        folders = get_grafana_folders(grafana_base_url, grafana_api_key)
+        print("Folders:", folders)
+        
+        # Determine the folder based on the dashboard title
+        if "2023" in dashboard_title:
+            folder_title = 'Fin-ops-2023'
+        elif "2024" in dashboard_title:
+            folder_title = 'Fin-ops-2024'
+        else:
+            raise ValueError("Dashboard title does not contain '2023' or '2024'")
+
+        # Get the folder ID based on the folder title
+        folder_id = get_folder_id(folders, folder_title)
+    
+        if not folder_id:
+            raise ValueError(f"Folder '{folder_title}' not found")
+        
+        # Set the folderId in the request payload
+        payload = {
+            'dashboard': dashboard['dashboard'],
+            'folderId': folder_id,
+            'overwrite': False
+        }
+        
+        # Create a new dashboard by saving the copy in the specified folder
+        response_copy = requests.post(f'{grafana_base_url}/api/dashboards/db', headers=headers, json=payload)
+        print("Response Copy:", response_copy)
+
+        if response_copy.status_code != 200:
+            print('Error:', response_copy.content)
+            return {
+                'statusCode': response_copy.status_code,
+                'body': json.dumps({'error': response_copy.content.decode('utf-8')})
+            }
+
+        # Get the newly created dashboard's UID and URL
+        new_dashboard = response_copy.json()
+        new_dashboard_uid = new_dashboard['uid']
+        new_grafana_url = f'{grafana_base_url}/api/dashboards/uid/{new_dashboard_uid}'
+
+        # Fetch the newly created dashboard
+        response_new = requests.get(new_grafana_url, headers=headers)
+        print(response_new)
+
+        if response_new.status_code != 200:
+            print('Error:', response_new.content)
+            return {
+                'statusCode': response_new.status_code,
+                'body': json.dumps({'error': response_new.content.decode('utf-8')})
+            }
+
+        new_dashboard = json.loads(response_new.content)
+        print(new_dashboard)
+
+        panels_to_update = [panel['title'] for panel in new_dashboard['dashboard']['panels']]
+        print("Panels to update:", panels_to_update)
+
+        # Update panels' data source and URLs
+        for panel in new_dashboard['dashboard']['panels']:
+            for target in panel['targets']:
+                target['datasource']['type'] = 'yesoreyeram-infinity-datasource'
+                target['url'] = s3_url
+            print("Updated panel URL:", s3_url)
+
+        # Save the updated dashboard
+        response_update = requests.post(f'{grafana_base_url}/api/dashboards/db', headers=headers, json=payload)
+        print("Response Update:", response_update)
+
+        if response_update.status_code != 200:
+            print('Error:', response_update.content)
+            return {
+                'statusCode': response_update.status_code,
+                'body': json.dumps({'error': response_update.content.decode('utf-8')})
+            }
+
+        print('Dashboard modified successfully')
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Dashboard modified successfully')
+        }
+
+    except Exception as e:
+        print("An error occurred:", str(e))
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+
+#######################updated###############################
+import json
+import boto3
+import requests
+import os
+import re
+from urllib.parse import unquote_plus
+
+grafana_base_url = 'http://3.109.56.223:3000'
+s3_client = boto3.client('s3')
+secrets_client = boto3.client('secretsmanager', region_name='ap-south-1')
+
 def get_secret(secret_name):
     try:
         get_secret_value_response = secrets_client.get_secret_value(SecretId=secret_name)
@@ -26,14 +211,13 @@ def get_grafana_folders(grafana_base_url, grafana_api_key):
     }
     
     url = f"{grafana_base_url}/api/folders"
-    response = requests.get(url, headers=headers)  #using GET method will be getting grafana_api_key
+    response = requests.get(url, headers=headers)
     response.raise_for_status()
     
-    folders = response.json()  #List of Folders
+    folders = response.json()
     return folders
 
-#getting folder id with the folder title
-def get_folder_id(folders, folder_title):  
+def get_folder_id(folders, folder_title):
     for folder in folders:
         if folder['title'] == folder_title:
             return folder['id']
@@ -44,11 +228,11 @@ def create_folder(grafana_base_url, grafana_api_key, folder_title):
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {grafana_api_key}'
     }
-    #containing the title of the folder to be created
+    
     payload = {
         'title': folder_title
     }
-    #Sends a POST request to the constructed URL with the specified headers and payload.
+    
     url = f"{grafana_base_url}/api/folders"
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
@@ -56,11 +240,10 @@ def create_folder(grafana_base_url, grafana_api_key, folder_title):
     folder = response.json()
     return folder
 
-def extract_year_from_title(title):  #this function is used to extract the year for folder process 
+def extract_year_from_title(title):
     match = re.search(r'\b(20\d{2})\b', title)
     return match.group(1) if match else None
 
-#It processes S3 event notifications and performs actions based on the event data
 def lambda_handler(event, context):
     try:
         bucket = event['Records'][0]['s3']['bucket']['name']
